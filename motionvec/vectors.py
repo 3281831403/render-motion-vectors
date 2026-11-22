@@ -1,4 +1,4 @@
-"""屏幕空间运动向量的核心计算（待实现）。
+"""屏幕空间运动向量的核心计算。
 
 约定
 ----
@@ -11,170 +11,202 @@
   ``prev_view`` / ``prev_proj``。接受两个相机状态的函数从各自的
   ``view`` / ``proj`` 读取当前帧与上一帧，额外的键会被忽略。
 * 非法输入统一抛出 :class:`MotionError`。
-
-``motionvec/vectors.py`` 是本题的核心，tests/test_vectors.py 中的 15 个
-测试当前全部失败；需要实现下面 8 个函数，契约见各函数 docstring。
 """
+
+import math
 
 SCREEN_WIDTH = 1000.0
 SCREEN_HEIGHT = 1000.0
+
+_W_EPS = 1e-12
 
 
 class MotionError(Exception):
     """运动向量计算中的非法输入或不可逆变换。"""
 
 
+def _check_finite(values, what):
+    for v in values:
+        if not math.isfinite(v):
+            raise MotionError("%s 含 NaN/Inf" % what)
+
+
+def _check_matrix(m, what):
+    try:
+        rows = [list(row) for row in m]
+    except TypeError:
+        raise MotionError("%s 不是 4x4 矩阵" % what)
+    if len(rows) != 4 or any(len(row) != 4 for row in rows):
+        raise MotionError("%s 不是 4x4 矩阵" % what)
+    for row in rows:
+        _check_finite(row, what)
+    return rows
+
+
+def _mat_vec(m, v):
+    return [sum(m[i][j] * v[j] for j in range(4)) for i in range(4)]
+
+
+def _invert4(m):
+    """4x4 矩阵求逆（Gauss-Jordan，部分主元）；奇异时抛 MotionError。"""
+    n = 4
+    aug = [list(m[i]) + [1.0 if i == j else 0.0 for j in range(n)]
+           for i in range(n)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[piv][col]) <= _W_EPS:
+            raise MotionError("矩阵奇异，不可逆")
+        aug[col], aug[piv] = aug[piv], aug[col]
+        inv_piv = 1.0 / aug[col][col]
+        aug[col] = [x * inv_piv for x in aug[col]]
+        for r in range(n):
+            if r != col and aug[r][col] != 0.0:
+                factor = aug[r][col]
+                aug[r] = [a - factor * b for a, b in zip(aug[r], aug[col])]
+    return [row[n:] for row in aug]
+
+
 def project(pos, view, proj):
-    """把世界坐标投影到屏幕像素坐标。
-
-    参数:
-        pos: ``(x, y, z)`` 世界坐标。
-        view: 4x4 行主序视图矩阵。
-        proj: 4x4 行主序投影矩阵。
-
-    返回:
-        ``(x_px, y_px, depth)``。``x_px`` / ``y_px`` 为像素坐标，必须做
-        ``w`` 除法并翻转屏幕 y 轴；``depth`` 为相机前方的正距离
-        （视图空间 ``-z``）。
-
-    异常:
-        MotionError: 输入含 NaN/Inf，或齐次坐标 ``w`` 约等于 0。
-    """
-    raise NotImplementedError
+    """把世界坐标投影到屏幕像素坐标。"""
+    _check_finite(pos, "pos")
+    view = _check_matrix(view, "view")
+    proj = _check_matrix(proj, "proj")
+    world = [pos[0], pos[1], pos[2], 1.0]
+    view_pos = _mat_vec(view, world)
+    clip = _mat_vec(proj, view_pos)
+    w = clip[3]
+    if not math.isfinite(w) or abs(w) <= _W_EPS:
+        raise MotionError("齐次坐标 w 约等于 0，无法做透视除法")
+    ndc_x = clip[0] / w
+    ndc_y = clip[1] / w
+    x_px = (ndc_x + 1.0) * 0.5 * SCREEN_WIDTH
+    y_px = (1.0 - ndc_y) * 0.5 * SCREEN_HEIGHT
+    depth = -view_pos[2]
+    return (x_px, y_px, depth)
 
 
 def reproject(uv, depth, view, proj):
-    """把屏幕像素坐标加深度反投影回世界坐标。
-
-    参数:
-        uv: ``(x_px, y_px)`` 屏幕像素坐标。
-        depth: 相机前方正距离（视图空间 ``-z``）。
-        view: 4x4 行主序视图矩阵。
-        proj: 4x4 行主序投影矩阵。
-
-    返回:
-        ``(x, y, z)`` 世界坐标。
-
-    异常:
-        MotionError: 深度非正或含 NaN/Inf、uv 非有限、矩阵奇异。
-    """
-    raise NotImplementedError
+    """把屏幕像素坐标加深度反投影回世界坐标。"""
+    _check_finite(uv, "uv")
+    if not math.isfinite(depth) or depth <= 0.0:
+        raise MotionError("深度必须为正的有限数")
+    view = _check_matrix(view, "view")
+    proj = _check_matrix(proj, "proj")
+    ndc_x = uv[0] / SCREEN_WIDTH * 2.0 - 1.0
+    ndc_y = 1.0 - uv[1] / SCREEN_HEIGHT * 2.0
+    # 视图空间点 p = (vx, vy, -depth, 1)，满足 ndc_i = (P[i]·p)/(P[3]·p)，
+    # 即 (P[i] - ndc_i * P[3])·p = 0，对 vx / vy 是 2x2 线性方程组。
+    vz = -depth
+    eqs = []
+    for i, ndc in ((0, ndc_x), (1, ndc_y)):
+        a = proj[i][0] - ndc * proj[3][0]
+        b = proj[i][1] - ndc * proj[3][1]
+        c = -((proj[i][2] - ndc * proj[3][2]) * vz
+              + (proj[i][3] - ndc * proj[3][3]))
+        eqs.append((a, b, c))
+    (a1, b1, c1), (a2, b2, c2) = eqs
+    det = a1 * b2 - a2 * b1
+    if abs(det) <= _W_EPS:
+        raise MotionError("投影矩阵奇异，无法反投影")
+    vx = (c1 * b2 - c2 * b1) / det
+    vy = (a1 * c2 - a2 * c1) / det
+    inv_view = _invert4(view)
+    world = _mat_vec(inv_view, [vx, vy, vz, 1.0])
+    w = world[3]
+    if not math.isfinite(w) or abs(w) <= _W_EPS:
+        raise MotionError("反投影结果的齐次 w 约等于 0")
+    return (world[0] / w, world[1] / w, world[2] / w)
 
 
 def pixel_motion(pos, cur, prev):
-    """同一世界点在当前帧与上一帧相机下的屏幕位移。
-
-    参数:
-        pos: ``(x, y, z)`` 世界坐标。
-        cur: 当前相机状态（至少含 ``view`` / ``proj``）。
-        prev: 上一帧相机状态（至少含 ``view`` / ``proj``）。
-
-    返回:
-        ``(dx, dy)``，单位为像素，等于当前帧屏幕坐标减上一帧屏幕坐标。
-    """
-    raise NotImplementedError
+    """同一世界点在当前帧与上一帧相机下的屏幕位移（像素）。"""
+    cx, cy, _ = project(pos, cur["view"], cur["proj"])
+    px, py, _ = project(pos, prev["view"], prev["proj"])
+    return (cx - px, cy - py)
 
 
 def camera_motion(uv, depth, cur, prev):
-    """纯相机运动：静态世界点从上一帧到当前帧的屏幕位移。
-
-    用当前相机把 ``(uv, depth)`` 反投影成世界点，再用上一帧相机投影，
-    结果等于当前 uv 减上一帧 uv。该函数用于静态物体；相机完全静止时
-    返回值应在 ``1e-6`` 内为 ``(0, 0)``。
-
-    参数:
-        uv: 当前帧的屏幕像素坐标。
-        depth: 该像素对应的相机前方正距离。
-        cur: 当前相机状态（至少含 ``view`` / ``proj``）。
-        prev: 上一帧相机状态（至少含 ``view`` / ``proj``）。
-
-    返回:
-        ``(dx, dy)`` 像素位移。
-    """
-    raise NotImplementedError
+    """纯相机运动：静态世界点从上一帧到当前帧的屏幕位移。"""
+    world = reproject(uv, depth, cur["view"], cur["proj"])
+    px, py, _ = project(world, prev["view"], prev["proj"])
+    return (uv[0] - px, uv[1] - py)
 
 
 def object_motion(pos, cur, prev, prev_pos):
-    """物体相对相机的屏幕运动，单位为像素。
-
-    先计算总屏幕位移
-    ``project(pos, cur) - project(prev_pos, prev)``，再减去当前像素处的
-    纯相机运动 :func:`camera_motion`，避免动态物体被双重计算。
-    ``pos == prev_pos`` 的静态物体结果应在 ``1e-6`` 内为 ``(0, 0)``。
-
-    参数:
-        pos: 当前帧世界坐标。
-        cur: 当前相机状态。
-        prev: 上一帧相机状态。
-        prev_pos: 上一帧世界坐标。
-
-    返回:
-        ``(dx, dy)`` 像素位移。
-    """
-    raise NotImplementedError
+    """物体相对相机的屏幕运动（像素），已减去纯相机运动。"""
+    cx, cy, depth = project(pos, cur["view"], cur["proj"])
+    px, py, _ = project(prev_pos, prev["view"], prev["proj"])
+    cam_dx, cam_dy = camera_motion((cx, cy), depth, cur, prev)
+    return ((cx - px) - cam_dx, (cy - py) - cam_dy)
 
 
 def clamp_vectors(vecs, max_len):
-    """按欧氏长度钳制一组二维向量，返回新列表。
-
-    长度超过 ``max_len`` 的向量保持方向并缩放到 ``max_len``；未超长的
-    向量原样返回；零向量保持为零。输入序列不会被修改。
-
-    参数:
-        vecs: 可迭代的 ``(dx, dy)`` 序列。
-        max_len: 最大长度，必须为正的有限数（像素）。
-
-    返回:
-        与输入等长、同序的 ``[(dx, dy), ...]``。
-
-    异常:
-        MotionError: ``max_len <= 0``、非有限，或某个分量非有限。
-    """
-    raise NotImplementedError
+    """按欧氏长度钳制一组二维向量，返回新列表。"""
+    if (isinstance(max_len, bool)
+            or not isinstance(max_len, (int, float))
+            or not math.isfinite(max_len) or max_len <= 0.0):
+        raise MotionError("max_len 必须为正的有限数")
+    result = []
+    for vec in vecs:
+        dx, dy = vec
+        if not math.isfinite(dx) or not math.isfinite(dy):
+            raise MotionError("向量分量含 NaN/Inf")
+        length = math.hypot(dx, dy)
+        if length > max_len:
+            scale = max_len / length
+            result.append((dx * scale, dy * scale))
+        else:
+            result.append((dx, dy))
+    return result
 
 
 def validate(uv, depth, vecs):
-    """检查一个像素的运动向量输入，返回问题列表（不抛异常）。
-
-    检查项：``depth <= 0`` 或非有限；uv 含 NaN/Inf 或超出视口
-    ``[0, SCREEN_WIDTH] x [0, SCREEN_HEIGHT]``；向量分量含 NaN/Inf。
-    边界像素视为合法。
-
-    参数:
-        uv: 屏幕像素坐标。
-        depth: 相机前方正距离。
-        vecs: 待检查的 ``(dx, dy)`` 序列。
-
-    返回:
-        字符串问题列表；全部合法时为空列表 ``[]``。
-    """
-    raise NotImplementedError
+    """检查一个像素的运动向量输入，返回问题列表（不抛异常）。"""
+    issues = []
+    if not math.isfinite(depth) or depth <= 0.0:
+        issues.append("depth 必须为正的有限数")
+    ux, uy = uv
+    if not (math.isfinite(ux) and math.isfinite(uy)):
+        issues.append("uv 含 NaN/Inf")
+    elif not (0.0 <= ux <= SCREEN_WIDTH and 0.0 <= uy <= SCREEN_HEIGHT):
+        issues.append("uv 超出视口")
+    for vec in vecs:
+        dx, dy = vec
+        if not (math.isfinite(dx) and math.isfinite(dy)):
+            issues.append("向量分量含 NaN/Inf")
+            break
+    return issues
 
 
 def vector_batch(frames, config):
-    """批量生成运动向量；任一帧非法时整体失败，不返回部分结果。
+    """批量生成运动向量；任一帧非法时整体失败，不返回部分结果。"""
+    max_len = config.get("max_len") if hasattr(config, "get") else None
+    if (isinstance(max_len, bool)
+            or not isinstance(max_len, (int, float))
+            or not math.isfinite(max_len) or max_len <= 0.0):
+        raise MotionError("max_len 必须为正的有限数")
 
-    每个帧字典为 ``{"pos": (x, y, z), "prev_pos": (x, y, z),
-    "camera": {...}}``，其中相机字典含 ``view``、``proj``、
-    ``prev_view``、``prev_proj``。``config`` 至少含正的 ``max_len``
-    （像素）。
+    out_frames = []
+    for index, f in enumerate(frames):
+        cam = f["camera"]
+        cur_view = _check_matrix(cam["view"], "view")
+        cur_proj = _check_matrix(cam["proj"], "proj")
+        prev_view = _check_matrix(cam["prev_view"], "prev_view")
+        prev_proj = _check_matrix(cam["prev_proj"], "prev_proj")
 
-    每帧的向量为纯相机运动与物体相对运动之和，即当前帧世界点与上一帧
-    世界点在屏幕上的总位移，最后按 ``max_len`` 钳制。各帧使用独立局部
-    结果，不共享可变缓冲；计算过程中任一步失败都必须整体回滚，不能
-    留下部分结果或被污染的状态。
+        x, y, depth = project(f["pos"], cur_view, cur_proj)
+        px, py, _ = project(f["prev_pos"], prev_view, prev_proj)
+        vec = (x - px, y - py)
 
-    参数:
-        frames: 帧字典序列，可为空。
-        config: ``{"max_len": float}``。
+        issues = validate((x, y), depth, [vec])
+        if issues:
+            raise MotionError("帧 %d 非法: %s" % (index, "; ".join(issues)))
 
-    返回:
-        ``{"count": int, "max_len": float, "frames": [
-        {"index": i, "uv": (x, y), "depth": d, "vector": (dx, dy)}, ...]}``；
-        空输入返回 ``count == 0`` 且 ``frames == []``。
-
-    异常:
-        MotionError: ``max_len <= 0`` 或非有限；任一帧的相机/位置非法、
-        uv 越界、深度非正、向量非有限。
-    """
-    raise NotImplementedError
+        (clamped,) = clamp_vectors([vec], max_len)
+        out_frames.append({
+            "index": index,
+            "uv": (x, y),
+            "depth": depth,
+            "vector": clamped,
+        })
+    return {"count": len(out_frames), "max_len": max_len, "frames": out_frames}
